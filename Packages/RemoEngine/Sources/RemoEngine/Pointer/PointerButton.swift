@@ -4,5 +4,5 @@
 //
 
 public enum PointerButton: UInt8, Sendable {
-    case leftClick = 1, rightClick, leftDown, leftUp
+    case leftClick = 1, rightClick, leftDown, leftUp, rightDown, rightUp
 }

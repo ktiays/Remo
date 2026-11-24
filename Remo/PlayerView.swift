@@ -37,6 +37,7 @@ struct PlayerView: View {
                 onInput: player.handleTrackpad,
                 excludedRects: [controlsFrame] + (keyboardVisible ? [keyboardFrame] : []),
                 showsWheel: player.phase == .streaming && player.remoteControlAvailable,
+                controlsPointer: player.phase == .streaming && player.remoteControlAvailable,
                 surface: surface, videoSize: player.videoSize,
                 bottomInset: keyboardVisible ? keyboardFrame.height : 0)
 

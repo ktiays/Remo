@@ -160,15 +160,32 @@ public final class RemoteScreenClient {
         scheduleMove()
     }
 
-    public func pressPointer(_ button: PointerButton) {
+    /// Moves the remote pointer to an absolute position, normalized to the display with the
+    /// origin at its upper left. The same pacing and coalescing as `movePointer(by:)` apply.
+    public func movePointer(to position: CGPoint) {
+        guard isRunning, state == .streaming, pointer.move(to: position) else { return }
+        pointerMovedLocally = true
+        publishCursor()
+        scheduleMove()
+    }
+
+    public func pressPointer(_ button: PointerButton, clickCount: Int = 1) {
         // The button lands where the cursor is drawn; send the move first so hover is right.
         flushMove()
-        sendPointer { $0.press(button) }
+        sendPointer { $0.press(button, clickCount: clickCount) }
     }
 
     /// Whole lines; positive values move the content down, following the finger.
     public func scroll(lines: Int) {
         sendPointer { $0.scroll(lines: lines) }
+    }
+
+    /// Scrolls both axes at `position`, normalized like `movePointer(to:)`, in `unit` steps
+    /// signed like `scroll(lines:)`.
+    public func scrollPointer(
+        by delta: CGVector, unit: PointerScrollUnit, at position: CGPoint
+    ) {
+        sendPointer { $0.scroll(by: delta, unit: unit, at: position) }
     }
 
     private func scheduleMove() {

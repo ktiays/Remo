@@ -15,12 +15,30 @@ import Testing
         .move(sequence: 4, afterButton: 3, position: position),
         .button(sequence: 5, afterButton: 3, action: .rightClick, position: position),
         .scroll(lines: -3),
+        .button(sequence: 7, afterButton: 5, action: .leftDown, clickCount: 2, position: position),
+        .button(sequence: 8, afterButton: 7, action: .rightDown, position: position),
+        .scrollVector(unit: .pixel, x: -13, y: 6, position: position),
+        .scrollVector(unit: .line, x: 2, y: 0, position: position),
     ]
     for message in messages {
         let decoded = try PointerMessage(decoding: message.encoded)
         #expect(decoded == message)
         #expect(throws: WireFormatError.self) {
             try PointerMessage(decoding: message.encoded.dropLast())
+        }
+    }
+    var badCount = messages[3].encoded
+    badCount[19] = 0
+    #expect(throws: WireFormatError.self) {
+        try PointerMessage(decoding: badCount)
+    }
+    for badScroll in [
+        PointerMessage.scrollVector(unit: .line, x: 0, y: 0, position: position),
+        .scrollVector(unit: .line, x: 101, y: 0, position: position),
+        .scrollVector(unit: .pixel, x: -1, y: 1, position: CGPoint(x: 1.1, y: 0)),
+    ] {
+        #expect(throws: WireFormatError.self) {
+            try PointerMessage(decoding: badScroll.encoded)
         }
     }
     let invalid = PointerMessage.button(
@@ -34,6 +52,7 @@ import Testing
     // The newest move must arrive too: the client already draws the cursor there.
     #expect(messages[0].delivery.retryBudget == .infinity && messages[0].delivery.priority == .high)
     #expect(messages[0].delivery.replacing != nil && messages[2].delivery.replacing == nil)
+    #expect(messages[5].delivery.retryBudget == 0 && messages[5].delivery.replacing == nil)
 }
 
 @Test @MainActor func pointerMovesRespectButtonOrderAndClickPositions() {
@@ -63,8 +82,8 @@ import Testing
     send(.scroll(lines: -3))
 
     #expect(events == [
-        .button(.leftDown, start), .move(dragged, dragging: true),
-        .move(end, dragging: true), .button(.leftUp, end),
+        .button(.leftDown, start), .move(dragged, dragging: .leftDown),
+        .move(end, dragging: .leftDown), .button(.leftUp, end),
         .button(.rightClick, clicked), .scroll(lines: -3),
     ])
 }
@@ -88,8 +107,8 @@ import Testing
     #expect(events.isEmpty)
     send(.button(sequence: 2, afterButton: 0, action: .leftDown, position: down))
     #expect(events == [
-        .button(.leftDown, down), .move(up, dragging: true), .button(.leftUp, up),
-        .move(clicked, dragging: false), .button(.rightClick, clicked),
+        .button(.leftDown, down), .move(up, dragging: .leftDown), .button(.leftUp, up),
+        .move(clicked), .button(.rightClick, clicked),
     ])
     // Duplicates and anything older than what has been applied change nothing.
     send(.button(sequence: 5, afterButton: 2, action: .leftUp, position: up))
@@ -175,7 +194,60 @@ import Testing
     let moved = CGPoint(x: 0.625, y: 0.4)
     let corner = CGPoint(x: 1, y: 1)
     #expect(events == [
-        .move(moved, dragging: false), .button(.leftDown, moved),
-        .move(corner, dragging: true), .button(.leftUp, corner), .scroll(lines: 100),
+        .move(moved), .button(.leftDown, moved),
+        .move(corner, dragging: .leftDown), .button(.leftUp, corner), .scroll(lines: 100),
+    ])
+}
+
+@Test func pointerClientQuantizesScrollVectorsAndMovesAbsolutely() {
+    let start = CGPoint(x: 0.25, y: 0.75)
+    let target = CGPoint(x: 0.75, y: 0.25)
+    var client = PointerControlClient()
+    let accepted = client.begin(position: start, displaySize: CGSize(width: 640, height: 360))
+    let moved = client.move(to: target)
+    let move = client.takeMove()
+    let primary = client.press(.leftDown, clickCount: 2)
+    #expect(accepted && moved)
+    #expect(move == .move(sequence: 1, afterButton: 0, position: target))
+    #expect(
+        primary == .button(
+            sequence: 2, afterButton: 0, action: .leftDown, clickCount: 2, position: target))
+    #expect(client.dragging)
+    _ = client.press(.leftUp, clickCount: 2)
+    #expect(!client.dragging)
+
+    let step = CGVector(dx: 0.5, dy: -0.75)
+    let fraction = client.scroll(by: step, unit: .pixel, at: target)
+    let lines = client.scroll(by: CGVector(dx: 2, dy: 0), unit: .line, at: start)
+    let pixels = client.scroll(by: step, unit: .pixel, at: target)
+    let moveAfterScroll = client.takeMove()
+    #expect(fraction == nil)
+    #expect(lines == .scrollVector(unit: .line, x: 2, y: 0, position: start))
+    #expect(pixels == .scrollVector(unit: .pixel, x: 1, y: -1, position: target))
+    #expect(moveAfterScroll == nil)
+}
+
+@Test @MainActor func secondaryDragIsOrderedAndScrollDoesNotMoveThePointer() {
+    let initial = CGPoint(x: 0.25, y: 0.25)
+    let dragged = CGPoint(x: 0.4, y: 0.4)
+    let scrollTarget = CGPoint(x: 0.9, y: 0.9)
+    let owner = UUID()
+    var events: [PointerControlServer.Event] = []
+    let server = PointerControlServer(
+        initialState: { .init(position: initial, width: 640, height: 360) },
+        emit: { events.append($0) })
+    #expect(server.begin(for: owner) != nil)
+
+    func send(_ input: PointerMessage) { server.receive(input.encoded, from: owner) }
+    send(.move(sequence: 2, afterButton: 1, position: dragged))
+    #expect(events.isEmpty)
+    send(.button(sequence: 1, afterButton: 0, action: .rightDown, clickCount: 2, position: initial))
+    send(.scrollVector(unit: .pixel, x: 8, y: -7, position: scrollTarget))
+    server.end(for: owner)
+    #expect(events == [
+        .button(.rightDown, initial, clickCount: 2),
+        .move(dragged, dragging: .rightDown, clickCount: 2),
+        .scrollVector(unit: .pixel, x: 8, y: -7, at: scrollTarget),
+        .button(.rightUp, dragged, clickCount: 2),
     ])
 }

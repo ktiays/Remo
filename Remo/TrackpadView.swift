@@ -3,15 +3,22 @@
 //  Copyright (c) 2026 Cyandev. All rights reserved.
 //
 
+import QuartzCore
 import RemoEngine
 import SwiftUI
 import UIKit
 
 enum TrackpadGesture {
+    /// Finger travel in view points.
     case move(CGPoint)
+    /// A hardware pointer position, normalized to the picture from its upper left.
+    case point(CGPoint)
     /// Whole lines; positive values move the content down, following the finger.
     case scroll(lines: Int)
-    case button(PointerButton)
+    /// A physical scroll: continuous deltas in points, or one unit per wheel notch.
+    /// The position is normalized to the picture and stays where scrolling began.
+    case scrollAt(delta: CGVector, unit: PointerScrollUnit, position: CGPoint)
+    case button(PointerButton, clickCount: Int = 1)
 }
 
 struct TrackpadView: View {
@@ -20,6 +27,8 @@ struct TrackpadView: View {
     var excludedRects: [CGRect] = []
     /// The wheel only makes sense while the remote mouse can be controlled.
     var showsWheel = true
+    /// Whether the session granted remote pointer control; hardware forwards only then.
+    var controlsPointer = false
     /// The picture, which this view zooms and pans.
     let surface: VideoSurface
     /// Pixel size of the remote picture, which the zoomed view is sized from.
@@ -36,15 +45,25 @@ struct TrackpadView: View {
         // frame so touches meant for the wheel reach it.
         ZStack(alignment: .trailing) {
             TrackpadRegion(
-                onInput: onInput, excludedRects: excludedRects + (showsWheel ? [wheelFrame] : []),
-                surface: surface, videoSize: videoSize, bottomInset: bottomInset
+                onInput: onInput, excludedRects: excludedRects + (wheelShown ? [wheelFrame] : []),
+                surface: surface, videoSize: videoSize, bottomInset: bottomInset,
+                controlsPointer: controlsPointer
             )
             .ignoresSafeArea()
-            if showsWheel {
+            if wheelShown {
                 wheelOverlay
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// The on-screen wheel is for fingers; a Mac already has real scrolling.
+    private var wheelShown: Bool {
+        #if targetEnvironment(macCatalyst)
+            false
+        #else
+            showsWheel
+        #endif
     }
 
     @ViewBuilder
@@ -183,6 +202,8 @@ private struct WheelTouchArea: UIViewRepresentable {
             target: context.coordinator, action: #selector(Coordinator.press))
         press.minimumPressDuration = 0
         press.allowableMovement = .greatestFiniteMagnitude
+        // The wheel is for fingers; a hardware click here shouldn't animate it.
+        press.allowedTouchTypes = TouchSurface.fingerTouchTypes
         view.addGestureRecognizer(press)
         return view
     }
@@ -247,13 +268,20 @@ private struct Ticks: Shape {
 /// surface is the zoomed view, so zooming is a layer transform rather than a redraw. The scroll
 /// view’s pan needs two fingers, leaving single touches to the pointer gestures.
 ///
+/// A mouse or trackpad drives the pointer absolutely instead: hover moves it, its real buttons
+/// press, and wheel and two-finger scrolls go to the remote screen. A physical scroll never
+/// pans the local picture; a physical pinch still zooms it.
+///
 /// Touches inside `excludedRects` (window space) are left to the SwiftUI controls drawn over it.
 /// Taps are read from raw touches rather than a `UITapGestureRecognizer`: SwiftUI makes buttons
 /// drawn over this view wait for such a recognizer to fail, which it never does for touches it
 /// isn’t given, so those buttons stopped responding.
 private final class TouchSurface: UIScrollView {
-    var excludedRects: [CGRect] = []
+    var excludedRects: [CGRect] = [] {
+        didSet { if excludedRects != oldValue { invalidatePointerStyle() } }
+    }
     var onTap: (() -> Void)?
+    var onGesture: ((TrackpadGesture) -> Void)?
     var videoSize: CGSize? {
         didSet { if videoSize != oldValue { resetZoom() } }
     }
@@ -277,8 +305,46 @@ private final class TouchSurface: UIScrollView {
             resetZoom()
         }
     }
+
+    private var videoSurface: VideoSurface? { zoomContent as? VideoSurface }
+
+    /// Whether the session granted remote control; hardware input forwards only then.
+    var controlsPointer = false {
+        didSet {
+            guard controlsPointer != oldValue else { return }
+            if !controlsPointer { endHardwareCapture() }
+            invalidatePointerStyle()
+        }
+    }
+
     private var tapStart: (location: CGPoint, time: TimeInterval)?
     private var laidOutSize = CGSize.zero
+    /// Hardware moves the cursor directly, so panning the zoomed view after it would chase the
+    /// user's own input; finger input still lets the picture follow the cursor.
+    private var lastInputWasHardware = false
+
+    static let hardwareTouchTypes: Set<UITouch.TouchType> = [.indirectPointer]
+    static let fingerTouchTypes: [NSNumber] = [
+        NSNumber(value: UITouch.TouchType.direct.rawValue),
+        NSNumber(value: UITouch.TouchType.pencil.rawValue),
+    ]
+
+    private enum HardwareButton {
+        case primary, secondary
+        var down: PointerButton { self == .primary ? .leftDown : .rightDown }
+        var up: PointerButton { self == .primary ? .leftUp : .rightUp }
+    }
+
+    private var capture: (touch: ObjectIdentifier, button: HardwareButton, clickCount: Int)?
+    private var lastPointerLocation: CGPoint?
+    private var scrollAnchor: CGPoint?
+    private var scrollLast = CGPoint.zero
+    private var scrollHasChanged = false
+    private var momentumLink: CADisplayLink?
+    private var momentumLast: CFTimeInterval = 0
+    private var momentumVelocity = CGPoint.zero
+    private var lastClick: (time: TimeInterval, point: CGPoint, count: Int)?
+    private var pointerInteraction: UIPointerInteraction?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -290,6 +356,27 @@ private final class TouchSurface: UIScrollView {
         contentInsetAdjustmentBehavior = .never
         delaysContentTouches = false
         panGestureRecognizer.minimumNumberOfTouches = 2
+        // Only fingers pan the picture; two-finger trackpad scroll goes to the remote screen.
+        panGestureRecognizer.allowedTouchTypes = Self.fingerTouchTypes
+        panGestureRecognizer.allowedScrollTypesMask = []
+
+        let pointerInteraction = UIPointerInteraction(delegate: self)
+        addInteraction(pointerInteraction)
+        self.pointerInteraction = pointerInteraction
+        addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(hover)))
+        for mask: UIScrollTypeMask in [.discrete, .continuous] {
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(scrollGesture(_:)))
+            pan.allowedTouchTypes = []
+            pan.allowedScrollTypesMask = mask
+            addGestureRecognizer(pan)
+        }
+        let center = NotificationCenter.default
+        center.addObserver(
+            self, selector: #selector(sceneWillDeactivate(_:)),
+            name: UIScene.willDeactivateNotification, object: nil)
+        center.addObserver(
+            self, selector: #selector(windowDidResignKey(_:)),
+            name: UIWindow.didResignKeyNotification, object: nil)
     }
 
     @available(*, unavailable)
@@ -299,12 +386,18 @@ private final class TouchSurface: UIScrollView {
         excludedRects.contains { $0.contains(windowPoint) }
     }
 
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { endHardwareCapture() }
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         if bounds.size != laidOutSize {
             laidOutSize = bounds.size
             resetZoom()
         }
+        invalidatePointerStyle()
     }
 
     /// Shows the whole picture, fitted and centered.
@@ -325,7 +418,8 @@ private final class TouchSurface: UIScrollView {
     /// Scrolls as little as it takes to show `rect` of `view` whole, so a zoomed-in view
     /// follows the cursor to its edges. A zoom or pan the user is making is left alone.
     func reveal(_ rect: CGRect, in view: UIView) {
-        guard !isZooming, !isZoomBouncing, !isDragging, !bounds.isEmpty else { return }
+        guard !isZooming, !isZoomBouncing, !isDragging, !bounds.isEmpty, !lastInputWasHardware
+        else { return }
         let target = view.convert(rect, to: self)
         let visible = CGRect(
             x: bounds.minX, y: bounds.minY,
@@ -392,16 +486,29 @@ private final class TouchSurface: UIScrollView {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesBegan(touches, with: event)
-        guard event?.allTouches?.count == 1, let touch = touches.first else {
+        stopMomentum()
+        if let event, pointerTouchBegan(touches, event: event) { return }
+        guard event?.allTouches?.count == 1, let touch = touches.first,
+            !Self.hardwareTouchTypes.contains(touch.type)
+        else {
             tapStart = nil
             return
         }
         tapStart = (touch.location(in: self), touch.timestamp)
+        lastInputWasHardware = false
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesMoved(touches, with: event)
+        pointerTouchMoved(touches)
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesEnded(touches, with: event)
-        guard let start = tapStart, let touch = touches.first else { return }
+        pointerTouchFinished(touches)
+        guard let start = tapStart,
+            let touch = touches.first(where: { !Self.hardwareTouchTypes.contains($0.type) })
+        else { return }
         tapStart = nil
         // The pan and hold recognizers cancel the touch once they begin, so a drag never ends here.
         let location = touch.location(in: self)
@@ -415,6 +522,242 @@ private final class TouchSurface: UIScrollView {
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesCancelled(touches, with: event)
         tapStart = nil
+        pointerTouchFinished(touches)
+    }
+
+    // MARK: Hardware pointer
+
+    /// A view point as a share of the remote picture, from its upper left. `clamping` lets a
+    /// drag that leaves the picture keep reporting at its edge instead of going silent.
+    private func normalizedPoint(_ point: CGPoint, clamping: Bool = false) -> CGPoint? {
+        guard let surface = videoSurface, let picture = surface.pictureRect else { return nil }
+        let local = convert(point, to: surface)
+        guard clamping || picture.contains(local) else { return nil }
+        let x = min(1, max(0, (local.x - picture.minX) / picture.width))
+        let y = min(1, max(0, (local.y - picture.minY) / picture.height))
+        return CGPoint(x: x, y: y)
+    }
+
+    private func emit(_ gesture: TrackpadGesture) {
+        guard controlsPointer else { return }
+        lastInputWasHardware = true
+        onGesture?(gesture)
+    }
+
+    private func pressedButton(in event: UIEvent) -> HardwareButton? {
+        let mask = event.buttonMask
+        if mask.contains(.secondary) { return .secondary }
+        if mask.contains(.primary) {
+            return event.modifierFlags.contains(.control) ? .secondary : .primary
+        }
+        return nil
+    }
+
+    private func pointerTouchBegan(_ touches: Set<UITouch>, event: UIEvent) -> Bool {
+        guard let touch = touches.first(where: { Self.hardwareTouchTypes.contains($0.type) })
+        else { return false }
+        let location = touch.location(in: self)
+        lastPointerLocation = location
+        guard capture == nil, let position = normalizedPoint(location),
+            let button = pressedButton(in: event)
+        else { return true }
+        let count = clickCount(of: touch, button: button)
+        capture = (ObjectIdentifier(touch), button, count)
+        emit(.point(position))
+        emit(.button(button.down, clickCount: count))
+        return true
+    }
+
+    private func pointerTouchMoved(_ touches: Set<UITouch>) {
+        guard let capture,
+            let touch = touches.first(where: { ObjectIdentifier($0) == capture.touch })
+        else { return }
+        let location = touch.location(in: self)
+        lastPointerLocation = location
+        guard let position = normalizedPoint(location, clamping: true) else { return }
+        emit(.point(position))
+    }
+
+    private func pointerTouchFinished(_ touches: Set<UITouch>) {
+        guard let capture,
+            let touch = touches.first(where: { ObjectIdentifier($0) == capture.touch })
+        else { return }
+        self.capture = nil
+        let location = touch.location(in: self)
+        lastPointerLocation = location
+        if let position = normalizedPoint(location, clamping: true) {
+            emit(.point(position))
+        }
+        emit(.button(capture.button.up, clickCount: capture.clickCount))
+    }
+
+    private func endHardwareCapture() {
+        stopMomentum()
+        scrollAnchor = nil
+        guard let capture else { return }
+        self.capture = nil
+        if let location = lastPointerLocation,
+            let position = normalizedPoint(location, clamping: true)
+        {
+            emit(.point(position))
+        }
+        emit(.button(capture.button.up, clickCount: capture.clickCount))
+    }
+
+    @objc private func sceneWillDeactivate(_ note: Notification) {
+        guard note.object as? UIWindowScene === window?.windowScene else { return }
+        endHardwareCapture()
+    }
+
+    @objc private func windowDidResignKey(_ note: Notification) {
+        guard note.object as? UIWindow === window else { return }
+        endHardwareCapture()
+    }
+
+    /// `tapCount` counts hardware presses, but a count the event leaves at one is rechecked
+    /// against the last press: same place, inside a third of a second, means a repeat.
+    private func clickCount(of touch: UITouch, button: HardwareButton) -> Int {
+        guard button == .primary else { return 1 }
+        if touch.tapCount > 1 { return touch.tapCount }
+        let location = touch.location(in: self)
+        var count = 1
+        if let last = lastClick,
+            touch.timestamp - last.time < 0.35,
+            hypot(location.x - last.point.x, location.y - last.point.y) < 10
+        {
+            count = last.count + 1
+        }
+        lastClick = (touch.timestamp, location, count)
+        return count
+    }
+
+    // MARK: Hover and scroll
+
+    @objc private func hover(_ gesture: UIHoverGestureRecognizer) {
+        guard gesture.state == .changed || gesture.state == .began else { return }
+        let location = gesture.location(in: self)
+        lastPointerLocation = location
+        guard let position = normalizedPoint(location) else { return }
+        emit(.point(position))
+    }
+
+    @objc private func scrollGesture(_ gesture: UIPanGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            stopMomentum()
+            scrollLast = .zero
+            scrollHasChanged = false
+            let location = gesture.location(in: self)
+            let translation = gesture.translation(in: self)
+            let pointer =
+                lastPointerLocation
+                ?? CGPoint(x: location.x - translation.x, y: location.y - translation.y)
+            scrollAnchor =
+                excludes(windowPoint: convert(pointer, to: nil)) ? nil : normalizedPoint(pointer)
+            sendScrollDelta(from: gesture)
+        case .changed:
+            scrollHasChanged = true
+            sendScrollDelta(from: gesture)
+        case .ended:
+            sendScrollDelta(from: gesture)
+            guard gesture.allowedScrollTypesMask == .continuous, scrollHasChanged else {
+                scrollAnchor = nil
+                return
+            }
+            beginMomentum(gesture.velocity(in: self))
+        case .cancelled, .failed:
+            scrollAnchor = nil
+            stopMomentum()
+        default:
+            break
+        }
+    }
+
+    private func sendScrollDelta(from gesture: UIPanGestureRecognizer) {
+        guard let position = scrollAnchor else {
+            scrollLast = gesture.translation(in: self)
+            return
+        }
+        let translation = gesture.translation(in: self)
+        let delta = CGVector(
+            dx: translation.x - scrollLast.x, dy: translation.y - scrollLast.y)
+        scrollLast = translation
+        guard delta != .zero else { return }
+        if gesture.allowedScrollTypesMask == .discrete {
+            var lines = CGVector.zero
+            if delta.dx != 0 { lines.dx = delta.dx > 0 ? 1 : -1 }
+            if delta.dy != 0 { lines.dy = delta.dy > 0 ? 1 : -1 }
+            emit(.scrollAt(delta: lines, unit: .line, position: position))
+        } else {
+            emit(.scrollAt(delta: delta, unit: .pixel, position: position))
+        }
+    }
+
+    /// UIKit reports no momentum phase for a scroll pan; coast from the release velocity.
+    private func beginMomentum(_ velocity: CGPoint) {
+        guard scrollAnchor != nil, controlsPointer, hypot(velocity.x, velocity.y) > 30 else {
+            scrollAnchor = nil
+            return
+        }
+        momentumVelocity = velocity
+        momentumLast = 0
+        let link = CADisplayLink(target: self, selector: #selector(momentum(_:)))
+        link.add(to: .main, forMode: .common)
+        momentumLink = link
+    }
+
+    func stopMomentum() {
+        momentumLink?.invalidate()
+        momentumLink = nil
+    }
+
+    @objc private func momentum(_ link: CADisplayLink) {
+        let elapsed = momentumLast == 0 ? link.duration : link.timestamp - momentumLast
+        momentumLast = link.timestamp
+        guard let position = scrollAnchor else {
+            stopMomentum()
+            return
+        }
+        let decay = pow(UIScrollView.DecelerationRate.normal.rawValue, elapsed * 1000)
+        let delta = CGVector(
+            dx: momentumVelocity.x * elapsed * (1 + decay) / 2,
+            dy: momentumVelocity.y * elapsed * (1 + decay) / 2)
+        momentumVelocity.x *= decay
+        momentumVelocity.y *= decay
+        if hypot(momentumVelocity.x, momentumVelocity.y) < 1 {
+            scrollAnchor = nil
+            stopMomentum()
+            return
+        }
+        if delta != .zero { emit(.scrollAt(delta: delta, unit: .pixel, position: position)) }
+    }
+
+    func invalidatePointerStyle() {
+        pointerInteraction?.invalidate()
+    }
+}
+
+extension TouchSurface: UIPointerInteractionDelegate {
+    func pointerInteraction(
+        _ interaction: UIPointerInteraction,
+        regionFor request: UIPointerRegionRequest,
+        defaultRegion: UIPointerRegion
+    ) -> UIPointerRegion? {
+        guard controlsPointer, let surface = videoSurface, let picture = surface.pictureRect else {
+            return nil
+        }
+        let local = convert(request.location, to: surface)
+        guard picture.contains(local), !excludes(windowPoint: convert(request.location, to: nil))
+        else { return nil }
+        let rect = surface.convert(picture, to: self).intersection(bounds)
+        return rect.isEmpty ? nil : UIPointerRegion(rect: rect)
+    }
+
+    func pointerInteraction(
+        _ interaction: UIPointerInteraction,
+        styleFor region: UIPointerRegion
+    ) -> UIPointerStyle? {
+        controlsPointer && videoSurface?.showsRemoteCursor == true ? .hidden() : nil
     }
 }
 
@@ -424,6 +767,7 @@ private struct TrackpadRegion: UIViewRepresentable {
     let surface: VideoSurface
     let videoSize: CGSize?
     let bottomInset: CGFloat
+    let controlsPointer: Bool
 
     func makeCoordinator() -> Coordinator { Coordinator(onInput: onInput) }
 
@@ -435,9 +779,11 @@ private struct TrackpadRegion: UIViewRepresentable {
         view.onTap = { [weak coordinator] in coordinator?.onInput(.button(.leftClick)) }
         let pan = UIPanGestureRecognizer(target: coordinator, action: #selector(Coordinator.pan))
         pan.maximumNumberOfTouches = 1
+        pan.allowedTouchTypes = TouchSurface.fingerTouchTypes
         let hold = UILongPressGestureRecognizer(
             target: coordinator, action: #selector(Coordinator.hold))
         hold.minimumPressDuration = 0.4
+        hold.allowedTouchTypes = TouchSurface.fingerTouchTypes
         pan.require(toFail: hold)
         coordinator.pointerPan = pan
         for recognizer in [pan, hold] as [UIGestureRecognizer] {
@@ -453,10 +799,13 @@ private struct TrackpadRegion: UIViewRepresentable {
         uiView.zoomContent = surface
         uiView.videoSize = videoSize
         uiView.bottomInset = bottomInset
+        uiView.onGesture = onInput
+        uiView.controlsPointer = controlsPointer
         surface.onCursorMoved = { [weak uiView, weak surface] frame in
             guard let uiView, let surface else { return }
             uiView.reveal(frame, in: surface)
         }
+        surface.onCursorVisibilityChanged = { [weak uiView] in uiView?.invalidatePointerStyle() }
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate, UIScrollViewDelegate {
@@ -475,9 +824,17 @@ private struct TrackpadRegion: UIViewRepresentable {
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? { surface?.zoomContent }
 
-        func scrollViewDidZoom(_ scrollView: UIScrollView) { surface?.centerContent() }
+        func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            surface?.centerContent()
+            surface?.invalidatePointerStyle()
+        }
+
+        func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            surface?.invalidatePointerStyle()
+        }
 
         func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
+            surface?.stopMomentum()
             cancelPointerDrag()
         }
 
@@ -500,10 +857,12 @@ private struct TrackpadRegion: UIViewRepresentable {
 
         // Touches on the controls drawn over the trackpad still reach these recognizers. Refusing
         // them would leave the recognizers pending, and SwiftUI buttons wait on them, so they are
-        // taken and later ignored instead.
+        // taken and later ignored instead. Hardware pointer buttons bypass these recognizers via
+        // `allowedTouchTypes` and take the view's own press/release path.
         func gestureRecognizer(
             _ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch
         ) -> Bool {
+            guard !TouchSurface.hardwareTouchTypes.contains(touch.type) else { return false }
             touchDown = touch.location(in: nil)
             return true
         }

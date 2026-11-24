@@ -9,9 +9,15 @@ import Foundation
 @MainActor
 final class PointerControlServer {
     enum Event: Equatable {
-        case move(CGPoint, dragging: Bool)
-        case button(PointerButton, CGPoint)
+        /// The button held while moving, or nil for a plain move; `clickCount` is that
+        /// button's click state so multi-click drags keep their count.
+        case move(CGPoint, dragging: PointerButton? = nil, clickCount: Int = 1)
+        case button(PointerButton, CGPoint, clickCount: Int = 1)
         case scroll(lines: Int32)
+        /// Two axes in `unit` steps at an explicit location, signed like `scroll(lines:)`.
+        /// The location stays out of pointer state: a scroll has no sequence, so an old
+        /// one arriving late must not roll a newer position back.
+        case scrollVector(unit: PointerScrollUnit, x: Int32, y: Int32, at: CGPoint)
     }
 
     private struct Move {
@@ -42,7 +48,9 @@ final class PointerControlServer {
     #endif
     private var owner: UUID?
     private var position = CGPoint.zero
-    private var leftDown = false
+    /// The button whose press is still down, and its click state.
+    private var heldButton: PointerButton?
+    private var heldClickCount = 1
     private var latestPosition: UInt64 = 0
     private var latestButton: UInt64 = 0
     private var pendingMove: Move?
@@ -69,6 +77,8 @@ final class PointerControlServer {
             receiveMove(Move(sequence: sequence, afterButton: afterButton, position: position))
         case let .scroll(lines):
             emit(.scroll(lines: lines))
+        case let .scrollVector(unit, x, y, position):
+            emit(.scrollVector(unit: unit, x: x, y: y, at: position))
         case .button:
             receiveButton(input)
         }
@@ -79,7 +89,9 @@ final class PointerControlServer {
     /// waits for it, which always arrives: button changes are sent until delivered.
     private func receiveButton(_ input: PointerMessage) {
         var next: PointerMessage? = input
-        while let current = next, case let .button(sequence, afterButton, action, position) = current {
+        while let current = next,
+            case let .button(sequence, afterButton, action, clickCount, position) = current
+        {
             next = nil
             guard afterButton >= latestButton, sequence > latestPosition else { return }
             if afterButton > latestButton {
@@ -89,21 +101,26 @@ final class PointerControlServer {
             latestButton = sequence
             latestPosition = sequence
             switch action {
-            case .leftDown where !leftDown:
-                leftDown = true
+            case .leftDown, .rightDown:
+                guard heldButton == nil else { break }
+                heldButton = action
+                heldClickCount = clickCount
                 self.position = position
-                emit(.button(action, position))
-            case .leftUp where leftDown:
-                if self.position != position { emit(.move(position, dragging: true)) }
-                leftDown = false
-                self.position = position
-                emit(.button(action, position))
-            case .leftClick, .rightClick:
-                if !leftDown {
-                    self.position = position
-                    emit(.button(action, position))
+                emit(.button(action, position, clickCount: clickCount))
+            case .leftUp, .rightUp:
+                guard action == heldButton?.released else { break }
+                if self.position != position {
+                    emit(.move(position, dragging: heldButton, clickCount: heldClickCount))
                 }
-            default: break
+                heldButton = nil
+                self.position = position
+                emit(.button(action, position, clickCount: heldClickCount))
+                heldClickCount = 1
+            case .leftClick, .rightClick:
+                if heldButton == nil {
+                    self.position = position
+                    emit(.button(action, position, clickCount: clickCount))
+                }
             }
             if let pendingMove, pendingMove.afterButton <= sequence {
                 self.pendingMove = nil
@@ -122,7 +139,7 @@ final class PointerControlServer {
         }
         latestPosition = move.sequence
         position = move.position
-        emit(.move(position, dragging: leftDown))
+        emit(.move(position, dragging: heldButton, clickCount: heldClickCount))
     }
 
     func end(for peer: UUID) {
@@ -130,8 +147,11 @@ final class PointerControlServer {
     }
 
     func stop() {
-        if leftDown { emit(.button(.leftUp, position)) }
-        leftDown = false
+        if let heldButton {
+            emit(.button(heldButton.released, position, clickCount: heldClickCount))
+        }
+        heldButton = nil
+        heldClickCount = 1
         owner = nil
         #if os(macOS)
             displayTarget?.onPost = { _ in }
@@ -140,6 +160,17 @@ final class PointerControlServer {
         latestButton = 0
         pendingMove = nil
         pendingButtons.removeAll()
+    }
+}
+
+private extension PointerButton {
+    /// The release that matches a press.
+    var released: PointerButton {
+        switch self {
+        case .leftDown: .leftUp
+        case .rightDown: .rightUp
+        default: self
+        }
     }
 }
 
@@ -170,35 +201,52 @@ final class PointerControlServer {
             }, emit: { event in
                 guard let geometry = DisplayGeometry(displayID: target.displayID) else { return }
                 let remoteFlags = modifierFlags()
-                let post: @MainActor (CGEventType, CGMouseButton, CGPoint) -> Void = {
-                    type, button, position in
+                let post: @MainActor (CGEventType, CGMouseButton, CGPoint, Int) -> Void = {
+                    type, button, position, clickCount in
                     let event = CGEvent(
                         mouseEventSource: source, mouseType: type,
                         mouseCursorPosition: geometry.location(of: position), mouseButton: button)
                     if !remoteFlags.isEmpty, let event {
                         event.flags = event.flags.union(remoteFlags)
                     }
-                    if type != .mouseMoved && type != .leftMouseDragged {
-                        event?.setIntegerValueField(.mouseEventClickState, value: 1)
+                    if type != .mouseMoved {
+                        event?.setIntegerValueField(
+                            .mouseEventClickState, value: Int64(clickCount))
                     }
                     event?.post(tap: .cghidEventTap)
                     target.onPost(position)
                 }
                 switch event {
-                case let .move(position, dragging):
-                    post(dragging ? .leftMouseDragged : .mouseMoved, .left, position)
-                case let .button(action, position):
+                case let .move(position, dragging, clickCount):
+                    switch dragging {
+                    case .leftDown?:
+                        post(.leftMouseDragged, .left, position, clickCount)
+                    case .rightDown?:
+                        post(.rightMouseDragged, .right, position, clickCount)
+                    default:
+                        post(.mouseMoved, .left, position, clickCount)
+                    }
+                case let .button(action, position, clickCount):
                     switch action {
-                    case .leftClick:
-                        post(.leftMouseDown, .left, position)
-                        post(.leftMouseUp, .left, position)
-                    case .rightClick:
-                        post(.rightMouseDown, .right, position)
-                        post(.rightMouseUp, .right, position)
+                    case .leftClick, .rightClick:
+                        // Multi-clicks post one pair per count, each stamped with it.
+                        let button: CGMouseButton = action == .leftClick ? .left : .right
+                        let down: CGEventType =
+                            action == .leftClick ? .leftMouseDown : .rightMouseDown
+                        let up: CGEventType =
+                            action == .leftClick ? .leftMouseUp : .rightMouseUp
+                        for count in 1...max(1, clickCount) {
+                            post(down, button, position, count)
+                            post(up, button, position, count)
+                        }
                     case .leftDown:
-                        post(.leftMouseDown, .left, position)
+                        post(.leftMouseDown, .left, position, clickCount)
                     case .leftUp:
-                        post(.leftMouseUp, .left, position)
+                        post(.leftMouseUp, .left, position, clickCount)
+                    case .rightDown:
+                        post(.rightMouseDown, .right, position, clickCount)
+                    case .rightUp:
+                        post(.rightMouseUp, .right, position, clickCount)
                     }
                 case let .scroll(lines):
                     let scrollEvent = CGEvent(
@@ -206,6 +254,18 @@ final class PointerControlServer {
                         wheel1: lines, wheel2: 0, wheel3: 0)
                     if !remoteFlags.isEmpty, let scrollEvent {
                         scrollEvent.flags = scrollEvent.flags.union(remoteFlags)
+                    }
+                    scrollEvent?.post(tap: .cghidEventTap)
+                case let .scrollVector(unit, x, y, position):
+                    let scrollEvent = CGEvent(
+                        scrollWheelEvent2Source: source,
+                        units: unit == .line ? .line : .pixel, wheelCount: 2,
+                        wheel1: y, wheel2: x, wheel3: 0)
+                    if let scrollEvent {
+                        scrollEvent.location = geometry.location(of: position)
+                        if !remoteFlags.isEmpty {
+                            scrollEvent.flags = scrollEvent.flags.union(remoteFlags)
+                        }
                     }
                     scrollEvent?.post(tap: .cghidEventTap)
                 }

@@ -284,3 +284,60 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
         }
     }
 }
+
+@Test @MainActor func clientSendsPositionedHardwareInputOverLoopback() async throws {
+    let firstClick = CGPoint(x: 0.2, y: 0.3)
+    let secondClick = CGPoint(x: 0.8, y: 0.7)
+    let scrollTarget = CGPoint(x: 0.4, y: 0.6)
+    let lastButton = PointerControlServer.Event.button(.leftUp, secondClick, clickCount: 2)
+    let scroll = PointerControlServer.Event.scrollVector(unit: .pixel, x: 9, y: -15, at: scrollTarget)
+    var events: [PointerControlServer.Event] = []
+    let pointer = PointerControlServer(
+        initialState: { .init(position: .zero, width: 1920, height: 1080) },
+        emit: { events.append($0) })
+    let keyboard = KeyboardControlServer(readCapsLock: { true }, emit: { _ in })
+    var port: UInt16?
+    let server = try await RemoteScreenServer(
+        configuration: .init(source: .custom { _ in SteppingSource() }, allowsRemoteControl: true),
+        cursor: nil, pointer: pointer, keyboard: keyboard
+    ) { event in
+        if case .listening(let value) = event { port = value }
+    }
+    let listening = Task { try await server.listen(on: 0) }
+    defer { server.stop() }
+    for _ in 0..<100 where port == nil { try await Task.sleep(for: .milliseconds(10)) }
+    let portValue = try #require(port.flatMap(NWEndpoint.Port.init(rawValue:)))
+    let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: portValue)
+
+    var capsLock: Bool?
+    let client = RemoteScreenClient(onFrame: { _ in }, onEvent: { event in
+        if case .controlAvailable(_, let isOn) = event { capsLock = isOn }
+    })
+    let run = Task { await client.run(.udp(endpoint)) }
+    defer { run.cancel() }
+    for _ in 0..<200 where client.state != .streaming || capsLock == nil {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(client.state == .streaming && capsLock == true)
+    client.movePointer(to: firstClick)
+    client.pressPointer(.leftDown, clickCount: 1)
+    client.pressPointer(.leftUp, clickCount: 1)
+    client.movePointer(to: secondClick)
+    client.pressPointer(.leftDown, clickCount: 2)
+    client.pressPointer(.leftUp, clickCount: 2)
+    client.scrollPointer(by: CGVector(dx: 9, dy: -15), unit: .pixel, at: scrollTarget)
+    for _ in 0..<200 {
+        if events.contains(lastButton), events.contains(scroll) { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    client.disconnect()
+    #expect(await run.value == nil)
+    #expect(events.contains(scroll))
+    let buttons = events.filter { if case .button = $0 { true } else { false } }
+    #expect(buttons == [
+        .button(.leftDown, firstClick), .button(.leftUp, firstClick),
+        .button(.leftDown, secondClick, clickCount: 2), lastButton,
+    ])
+    server.stop()
+    try await listening.value
+}

@@ -178,10 +178,15 @@ final class StreamPlayer {
                 min(bounds.width / displaySize.width, bounds.height / displaySize.height)
                 * surface.zoom
             client.movePointer(by: CGVector(dx: delta.x / scale, dy: delta.y / scale))
-        case let .button(action):
-            client.pressPointer(action)
+        case let .button(action, clickCount):
+            client.pressPointer(action, clickCount: clickCount)
         case let .scroll(lines):
             client.scroll(lines: lines)
+        case let .point(position):
+            // Hardware reports where the pointer is, not how far it went.
+            client.movePointer(to: position)
+        case let .scrollAt(delta, unit, position):
+            client.scrollPointer(by: delta, unit: unit, at: position)
         }
     }
 

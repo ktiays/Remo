@@ -39,10 +39,27 @@ final class VideoSurface: UIView {
     }
     /// Hears the cursor's frame, in this view's bounds, each time it moves.
     var onCursorMoved: ((CGRect) -> Void)?
+    /// The hardware pointer style changes only when the remote cursor appears or disappears.
+    var onCursorVisibilityChanged: (() -> Void)?
 
     /// Magnification applied by the zooming scroll view this view sits in; 1 shows the whole
     /// remote screen.
     var zoom: CGFloat { bounds.width > 0 ? frame.width / bounds.width : 1 }
+    /// Where the remote picture is fitted inside this view, letterboxed; `nil` before the
+    /// first frame or while the view has no size. Input and cursor placement share it.
+    var pictureRect: CGRect? {
+        guard let extent = lastImage?.extent, extent.width > 0, extent.height > 0,
+            !bounds.isEmpty
+        else { return nil }
+        let scale = min(bounds.width / extent.width, bounds.height / extent.height)
+        return CGRect(
+            x: bounds.midX - extent.width * scale / 2,
+            y: bounds.midY - extent.height * scale / 2,
+            width: extent.width * scale, height: extent.height * scale)
+    }
+
+    /// Whether a remote cursor picture is being drawn, for hiding the local pointer.
+    var showsRemoteCursor: Bool { !cursorLayer.isHidden }
 
     init() {
         let device = MTLCreateSystemDefaultDevice()
@@ -82,22 +99,18 @@ final class VideoSurface: UIView {
 
     /// Places the cursor on the picture as `render` fits it into the view.
     private func layoutCursor() {
+        let wasHidden = cursorLayer.isHidden
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        defer { CATransaction.commit() }
-        guard let cursor, cursor.visible, let image = cursor.image,
-            let extent = lastImage?.extent, extent.width > 0, extent.height > 0, !bounds.isEmpty
-        else {
+        if let cursor, cursor.visible, let image = cursor.image, let picture = pictureRect {
+            cursorLayer.contents = image
+            cursorLayer.frame = cursor.frame(in: picture)
+            cursorLayer.isHidden = false
+        } else {
             cursorLayer.isHidden = true
-            return
         }
-        let scale = min(bounds.width / extent.width, bounds.height / extent.height)
-        let picture = CGRect(
-            x: bounds.midX - extent.width * scale / 2, y: bounds.midY - extent.height * scale / 2,
-            width: extent.width * scale, height: extent.height * scale)
-        cursorLayer.contents = image
-        cursorLayer.frame = cursor.frame(in: picture)
-        cursorLayer.isHidden = false
+        CATransaction.commit()
+        if cursorLayer.isHidden != wasHidden { onCursorVisibilityChanged?() }
     }
 
     /// Re-renders sharper once a zoom settles. While zooming, the layer is simply scaled, which
